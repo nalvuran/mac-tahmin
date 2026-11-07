@@ -1,7 +1,7 @@
 // Maç Tahmin - model (Poisson + Dixon-Coles). Tarayıcıda window.Model, Node'da module.exports.
 (function (root) {
   // Varsayılan ayarlar; otomatik ayar ile değiştirilebilir.
-  const DEF = { cap: 4, halfLife: 90, prior: 4 };
+  const DEF = { cap: 4, halfLife: 90, prior: 4, stretch: 1 };
   let PAR = Object.assign({}, DEF);
   function setParams(p) { PAR = Object.assign({}, DEF, p || {}); }
   const RHO = -0.08;      // Dixon-Coles düşük skor düzeltmesi
@@ -84,7 +84,8 @@
   // opts: {homeAdj:{att,def}, awayAdj:{att,def}} yüzde; xg: {home:{gf,ga,xgf,xga}, away:{...}}
   function predict(R, homeId, awayId, opts) {
     opts = opts || {};
-    let aH = R.att[homeId] || 1, dH = R.def[homeId] || 1, aA = R.att[awayId] || 1, dA = R.def[awayId] || 1;
+    const k = (opts.par || PAR).stretch || 1; // güç farkını aç (favori olasılığı kalibrasyonu)
+    let aH = Math.pow(R.att[homeId] || 1, k), dH = Math.pow(R.def[homeId] || 1, k), aA = Math.pow(R.att[awayId] || 1, k), dA = Math.pow(R.def[awayId] || 1, k);
     const xg = opts.xg;
     if (xg && xg.home) { aH *= xgFactor(xg.home.gf, xg.home.xgf); dH *= xgFactor(xg.home.ga, xg.home.xga); }
     if (xg && xg.away) { aA *= xgFactor(xg.away.gf, xg.away.xgf); dA *= xgFactor(xg.away.ga, xg.away.xga); }
@@ -110,7 +111,7 @@
         if (day !== lastDay) { R = fitRatings(fx.slice(0, i), fx[i].ts, par, iters); lastDay = day; }
         const f = fx[i];
         if (R.att[f.home] && R.att[f.away]) {
-          const P = predict(R, f.home, f.away);
+          const P = predict(R, f.home, f.away, { par: par || PAR });
           const past = fx.slice(0, i);
           const base = {
             home: past.filter(x => x.hg > x.ag).length / past.length,
@@ -181,16 +182,19 @@
   }
 
     // Izgara araması: birden çok sezonda ortalama Brier skorunu en düşük yapan ayarlar
+  // İki aşamalı ızgara araması (ortalama Brier skoru en düşük olan):
+  // 1) çekme payı / ağırlık / sınır, 2) güç farkı açma (stretch)
   async function tune(seasons, onProgress) {
-    const grid = [];
-    [1, 2, 4, 8].forEach(prior => [60, 120, 100000].forEach(halfLife => [4, 6].forEach(cap => grid.push({ prior, halfLife, cap }))));
-    let best = null;
-    for (let g = 0; g < grid.length; g++) {
-      let b = 0, hit = 0;
-      seasons.forEach(fx => { const r = backtest(fx, 40, grid[g], 30); b += r.brier; hit += r.favHit; });
-      const cur = { par: grid[g], brier: b / seasons.length, favHit: hit / seasons.length };
-      if (!best || cur.brier < best.brier) best = cur;
-      if (onProgress) await onProgress(g + 1, grid.length);
+    const evalP = p => { let b = 0, hit = 0; seasons.forEach(fx => { const r = backtest(fx, 40, p, 30); b += r.brier; hit += r.favHit; }); return { par: p, brier: b / seasons.length, favHit: hit / seasons.length }; };
+    const g1 = [];
+    [1, 2, 4, 8].forEach(prior => [60, 120, 100000].forEach(halfLife => [4, 6].forEach(cap => g1.push({ prior, halfLife, cap, stretch: 1 }))));
+    const stretches = [1.1, 1.2, 1.3, 1.4, 1.5, 1.65];
+    const total = g1.length + 4 * stretches.length;
+    let best = null, step = 0;
+    for (const p of g1) { const c = evalP(p); if (!best || c.brier < best.brier) best = c; if (onProgress) await onProgress(++step, total); }
+    const base = best.par;
+    for (const prior of [1, 2, 4, 8]) for (const k of stretches) {
+      const c = evalP(Object.assign({}, base, { prior, stretch: k })); if (c.brier < best.brier) best = c; if (onProgress) await onProgress(++step, total);
     }
     return best;
   }
