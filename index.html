@@ -69,7 +69,7 @@ input[type=range]{padding:0;border:0;background:none}
 <main id="app"></main>
 <div class="foot">Sadece bilgilendirme amaçlıdır, bahis tavsiyesi değildir.</div>
 
-<script src="model.js?v=2"></script>
+<script src="model.js?v=3"></script>
 <script>
 const API = 'https://v3.football.api-sports.io/';
 const LEAGUES = [
@@ -240,6 +240,7 @@ async function viewMatch(f){
   try {
     setProg('Lig sonuçları yükleniyor…');
     state.ft = await loadFinished();
+    Model.setParams(ls.get('mt_params_'+state.league));
     state.R = Model.fitRatings(state.ft);
     setProg(''); render();
   } catch(e){ setProg(''); $('#res').innerHTML = `<div class="err">${e.message}</div>`; }
@@ -421,8 +422,38 @@ function viewBacktest(){
     <button id="btRun">Testi çalıştır</button></div>
     <p class="mut" style="margin:8px 0 0">Ücretsiz paket 2022–2024 sezonlarını açıyor.</p>
   </div>
+  <div class="card"><h2>Otomatik ayar</h2>
+    <p class="mut">Test ettiğin sezonları kullanarak modelin ayarlarını (lig ortalamasına çekme payı, son maçların ağırlığı, uç skor sınırı) bu lige göre en isabetli hale getirir. En az 2 sezonu test etmiş olman gerekir; ek istek harcamaz.</p>
+    <div id="tuneInfo" class="mut" style="margin-bottom:8px"></div>
+    <div class="row"><button id="tuneBtn" class="grow">⚙︎ Bu lig için otomatik ayarla</button><button class="sec" id="tuneReset">Sıfırla</button></div>
+    <div id="tuneRes" style="margin-top:10px"></div>
+  </div>
   <div id="prog" class="prog"></div><div id="btRes"></div>`;
   progEl = $('#prog');
+  const cachedSeasons = lg => [cur-1,cur-2,cur-3,cur-4,cur-5].map(y => ({y, d: ls.get(`mt_c_fixtures?league=${lg}&season=${y}&status=FT-AET-PEN`)})).filter(x => x.d && x.d.d && x.d.d.length >= 60);
+  const toFt = arr => arr.map(f => ({ts:f.fixture.timestamp, home:f.teams.home.id, away:f.teams.away.id, hn:f.teams.home.name, an:f.teams.away.name, hg:f.goals.home, ag:f.goals.away})).filter(f=>f.hg!=null&&f.ag!=null);
+  const showTuneInfo = () => {
+    const lg = +$('#btLg').value, cs = cachedSeasons(lg), p = ls.get('mt_params_'+lg);
+    $('#tuneInfo').innerHTML = `Test edilmiş sezonlar: <b>${cs.map(x=>x.y+'/'+String(x.y+1).slice(2)).join(', ')||'yok'}</b><br>Şu anki ayar: ${p?`<b style="color:var(--grn)">otomatik</b> (çekme ${p.prior}, ağırlık ${p.halfLife>9999?'eşit':p.halfLife+' gün'}, sınır ${p.cap})`:'varsayılan'}`;
+  };
+  showTuneInfo();
+  $('#btLg').onchange = showTuneInfo;
+  $('#tuneReset').onclick = () => { localStorage.removeItem('mt_params_'+$('#btLg').value); $('#tuneRes').innerHTML=''; showTuneInfo(); };
+  $('#tuneBtn').onclick = async () => {
+    const lg = +$('#btLg').value, cs = cachedSeasons(lg);
+    if(cs.length < 2){ $('#tuneRes').innerHTML = '<div class="err">Önce en az 2 sezonu test et (yukarıdan sezon seçip "Testi çalıştır").</div>'; return; }
+    $('#tuneBtn').disabled = true;
+    const seasons = cs.map(x => toFt(x.d.d));
+    let b0 = 0, h0 = 0; seasons.forEach(fx => { const r = Model.backtest(fx, 40, Model.DEF, 30); b0 += r.brier; h0 += r.favHit; }); b0 /= seasons.length; h0 /= seasons.length;
+    const best = await Model.tune(seasons, async (i,n) => { $('#tuneRes').innerHTML = `<div class="prog">Ayarlar deneniyor ${i}/${n}…</div>`; await new Promise(r=>setTimeout(r,0)); });
+    const better = best.brier < b0 - 0.0005;
+    if(better) ls.set('mt_params_'+lg, best.par); else localStorage.removeItem('mt_params_'+lg);
+    $('#tuneRes').innerHTML = `<table><tr><th></th><th class="r">Varsayılan</th><th class="r">En iyi ayar</th></tr>
+      <tr><td>Kazanan isabeti</td><td class="r">%${(h0*100).toFixed(1)}</td><td class="r"><b>%${(best.favHit*100).toFixed(1)}</b></td></tr>
+      <tr><td>Brier (düşük iyi)</td><td class="r">${b0.toFixed(4)}</td><td class="r"><b>${best.brier.toFixed(4)}</b></td></tr></table>
+      <p class="${better?'':'mut'}" style="margin:8px 0 0">${better?'✓ Yeni ayar kaydedildi; bu ligdeki tüm tahminlerde kullanılacak. Testi tekrar çalıştırıp farkı görebilirsin.':'Varsayılan ayar zaten en iyisi; değişiklik yapılmadı.'}</p>`;
+    $('#tuneBtn').disabled = false; showTuneInfo();
+  };
   $('#btRun').onclick = async () => {
     const lg = +$('#btLg').value, se = +$('#btSe').value;
     $('#btRun').disabled = true; $('#btRes').innerHTML = ''; setProg('Sezonun maçları yükleniyor…');
@@ -432,8 +463,8 @@ function viewBacktest(){
       if(ft.length < 60) throw new ApiError('Bu sezon için yeterli maç bulunamadı ('+ft.length+').');
       setProg(`${ft.length} maç hesaplanıyor…`);
       await new Promise(r=>setTimeout(r,30));
-      renderBacktest(Model.backtest(ft, 40), LEAGUES.find(l=>l.id===lg).n, se);
-      setProg('');
+      renderBacktest(Model.backtest(ft, 40, ls.get('mt_params_'+lg) || Model.DEF), LEAGUES.find(l=>l.id===lg).n, se);
+      setProg(''); showTuneInfo();
     } catch(e){ setProg(''); $('#btRes').innerHTML = `<div class="err">${e.message}</div>`; }
     $('#btRun').disabled = false;
   };

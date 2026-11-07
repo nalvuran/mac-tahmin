@@ -1,14 +1,16 @@
 // Maç Tahmin - model (Poisson + Dixon-Coles). Tarayıcıda window.Model, Node'da module.exports.
 (function (root) {
-  const CAP = 4;          // tek maçlık uç skorları sınırla (8-0 -> 4-0)
-  const HALF_LIFE = 90;   // gün; yeni maçlar daha ağır
-  const PRIOR_GAMES = 4;  // küçük örneklem için lig ortalamasına çekme
+  // Varsayılan ayarlar; otomatik ayar ile değiştirilebilir.
+  const DEF = { cap: 4, halfLife: 90, prior: 4 };
+  let PAR = Object.assign({}, DEF);
+  function setParams(p) { PAR = Object.assign({}, DEF, p || {}); }
   const RHO = -0.08;      // Dixon-Coles düşük skor düzeltmesi
   const MAXG = 8;
 
   // fixtures: [{home, away, hg, ag, ts}] (ts: saniye)
-  function fitRatings(fixtures, nowTs) {
+  function fitRatings(fixtures, nowTs, par, iters) {
     nowTs = nowTs || Date.now() / 1000;
+    par = par || PAR; const CAP = par.cap, HALF_LIFE = par.halfLife, PRIOR_GAMES = par.prior;
     const teams = new Set();
     fixtures.forEach(f => { teams.add(f.home); teams.add(f.away); });
     const att = {}, def = {};
@@ -19,7 +21,7 @@
     let muH = sw > 0 ? sh / sw : 1.5, muA = sw > 0 ? sa / sw : 1.2;
     if (fixtures.length < 20) { muH = (muH * fixtures.length + 1.5 * 20) / (fixtures.length + 20); muA = (muA * fixtures.length + 1.2 * 20) / (fixtures.length + 20); }
     const m = (muH + muA) / 2;
-    for (let it = 0; it < 60; it++) {
+    for (let it = 0; it < (iters || 60); it++) {
       const aN = {}, aD = {}, dN = {}, dD = {};
       teams.forEach(t => { aN[t] = PRIOR_GAMES * m; aD[t] = PRIOR_GAMES * m; dN[t] = PRIOR_GAMES * m; dD[t] = PRIOR_GAMES * m; });
       fixtures.forEach((f, i) => {
@@ -96,7 +98,7 @@
 
   // Geriye dönük test: her maçı sadece o günden önceki sonuçlarla tahmin et.
   // fixtures: [{home, away, hg, ag, ts, hn, an}] zamana göre sıralı. minGames: tahmine başlamadan önce gereken maç sayısı.
-  function backtest(fixtures, minGames) {
+  function backtest(fixtures, minGames, par, iters) {
     minGames = minGames || 40;
     const fx = fixtures.slice().sort((a, b) => a.ts - b.ts);
     const preds = [];
@@ -105,7 +107,7 @@
     while (i < fx.length) {
       const day = Math.floor(fx[i].ts / 86400);
       if (i >= minGames) {
-        if (day !== lastDay) { R = fitRatings(fx.slice(0, i), fx[i].ts); lastDay = day; }
+        if (day !== lastDay) { R = fitRatings(fx.slice(0, i), fx[i].ts, par, iters); lastDay = day; }
         const f = fx[i];
         if (R.att[f.home] && R.att[f.away]) {
           const P = predict(R, f.home, f.away);
@@ -178,6 +180,21 @@
     };
   }
 
-  root.Model = { fitRatings, predict, matrix, markets, pois, xgFactor, backtest };
+    // Izgara araması: birden çok sezonda ortalama Brier skorunu en düşük yapan ayarlar
+  async function tune(seasons, onProgress) {
+    const grid = [];
+    [1, 2, 4, 8].forEach(prior => [60, 120, 100000].forEach(halfLife => [4, 6].forEach(cap => grid.push({ prior, halfLife, cap }))));
+    let best = null;
+    for (let g = 0; g < grid.length; g++) {
+      let b = 0, hit = 0;
+      seasons.forEach(fx => { const r = backtest(fx, 40, grid[g], 30); b += r.brier; hit += r.favHit; });
+      const cur = { par: grid[g], brier: b / seasons.length, favHit: hit / seasons.length };
+      if (!best || cur.brier < best.brier) best = cur;
+      if (onProgress) await onProgress(g + 1, grid.length);
+    }
+    return best;
+  }
+
+  root.Model = { fitRatings, predict, matrix, markets, pois, xgFactor, backtest, tune, setParams, getParams: () => Object.assign({}, PAR), DEF };
   if (typeof module !== 'undefined') module.exports = root.Model;
 })(typeof window !== 'undefined' ? window : globalThis);
