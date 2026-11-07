@@ -164,9 +164,11 @@ async function viewList(){
   <div class="card">
     <select id="lg">${LEAGUES.map(l=>`<option value="${l.id}" ${l.id==state.league?'selected':''}>${l.n}</option>`).join('')}</select>
     <div class="mut" id="quota" style="margin-top:8px"></div>
+    <button class="sec" id="btBtn" style="width:100%;margin-top:10px">🧪 Modeli geçmiş sezonda test et</button>
   </div>
   <div id="list"><div class="prog">Maçlar yükleniyor…</div></div>`;
   $('#lg').onchange = e => { state.league = +e.target.value; ls.set('mt_league', state.league); viewList(); };
+  $('#btBtn').onclick = () => viewBacktest();
   api('status', 0, {free:true}).then(s => { const r=s.requests||{}; $('#quota').textContent = `Bugünkü istek: ${r.current}/${r.limit_day} · Paket: ${(s.subscription||{}).plan}`; }).catch(()=>{});
   try {
     const fx = await api(`fixtures?league=${state.league}&season=${season()}&next=20`, 180);
@@ -404,6 +406,66 @@ function commentary(P,H,A,xg,rows){
   const val = rows.filter(r=>r.ev!=null && r.ev>0.03).sort((a,b)=>b.ev-a.ev)[0];
   if(val) out.push(`Oranlara göre en değerli görünen: <b>${esc(val.g)} – ${esc(val.n)}</b> (model ${pct(val.p)}, oran ${val.o.toFixed(2)}).`);
   return out.map(t=>`<p>${t}</p>`).join('');
+}
+
+
+// ---- Geriye dönük test ----
+function viewBacktest(){
+  nav(true); window.scrollTo(0,0); $('#title').textContent = 'Model testi';
+  const cur = season();
+  app.innerHTML = `
+  <div class="card"><h2>Model geçmişte ne kadar isabetliydi?</h2>
+    <p class="mut">Seçtiğin sezonun her maçını model, sadece o maçtan <b>önceki</b> sonuçları bilerek tahmin eder; sonra gerçek sonuçla karşılaştırır. İlk 40 maç öğrenme için atlanır. Tek istek harcar.</p>
+    <select id="btLg">${LEAGUES.map(l=>`<option value="${l.id}" ${l.id==state.league?'selected':''}>${l.n}</option>`).join('')}</select>
+    <div class="row" style="margin-top:8px"><select id="btSe" class="grow">${[cur-2,cur-3,cur-4].map(y=>`<option value="${y}">${y}/${String(y+1).slice(2)}</option>`).join('')}</select>
+    <button id="btRun">Testi çalıştır</button></div>
+    <p class="mut" style="margin:8px 0 0">Ücretsiz paket 2022–2024 sezonlarını açıyor.</p>
+  </div>
+  <div id="prog" class="prog"></div><div id="btRes"></div>`;
+  progEl = $('#prog');
+  $('#btRun').onclick = async () => {
+    const lg = +$('#btLg').value, se = +$('#btSe').value;
+    $('#btRun').disabled = true; $('#btRes').innerHTML = ''; setProg('Sezonun maçları yükleniyor…');
+    try {
+      const fx = await api(`fixtures?league=${lg}&season=${se}&status=FT-AET-PEN`, Infinity, {noCacheEmpty:true});
+      const ft = fx.map(f => ({ts:f.fixture.timestamp, home:f.teams.home.id, away:f.teams.away.id, hn:f.teams.home.name, an:f.teams.away.name, hg:f.goals.home, ag:f.goals.away})).filter(f=>f.hg!=null&&f.ag!=null);
+      if(ft.length < 60) throw new ApiError('Bu sezon için yeterli maç bulunamadı ('+ft.length+').');
+      setProg(`${ft.length} maç hesaplanıyor…`);
+      await new Promise(r=>setTimeout(r,30));
+      renderBacktest(Model.backtest(ft, 40), LEAGUES.find(l=>l.id===lg).n, se);
+      setProg('');
+    } catch(e){ setProg(''); $('#btRes').innerHTML = `<div class="err">${e.message}</div>`; }
+    $('#btRun').disabled = false;
+  };
+}
+function renderBacktest(r, lgName, se){
+  const p1 = x => '%' + (x*100).toFixed(0);
+  const skill = 1 - r.brier / r.brierBase;
+  const verdict = skill > 0.06 ? 'Model, sadece "lig ortalamasına göre" tahmin etmekten belirgin şekilde daha iyi.' : skill > 0.02 ? 'Model, lig ortalamasından biraz daha iyi tahmin ediyor.' : 'Model bu sezonda lig ortalamasından anlamlı şekilde iyi değil.';
+  $('#btRes').innerHTML = `
+  <div class="card"><h2>${esc(lgName)} ${se}/${String(se+1).slice(2)} · ${r.n} maç</h2>
+    <div class="prob3"><div><span class="mut">Kazanan (1X2)</span><b>${p1(r.favHit)}</b></div><div><span class="mut">KG var/yok</span><b>${p1(r.btts)}</b></div><div><span class="mut">2.5 alt/üst</span><b>${p1(r.o25)}</b></div></div>
+    <p class="mut" style="margin:10px 0 0">Model en olası sonucu seçseydi bu oranlarda doğru bilirdi. Kıyas: her maça "ev sahibi kazanır" demek ${p1(r.homeAlways)} tutardı; KG ve alt/üst'te yazı-tura %50.</p>
+    <div class="kv" style="margin-top:8px"><span>Kesin skor (en olası skor)</span><b>${p1(r.exact)}</b></div>
+    <div class="kv"><span>Olasılık kalitesi (Brier)</span><b>${r.brier.toFixed(3)} <span class="mut">/ taban ${r.brierBase.toFixed(3)}</span></b></div>
+    <p style="margin:8px 0 0">${verdict} <span class="mut">(Brier düşükse daha iyi; tabandan %${(skill*100).toFixed(1)} iyi.)</span></p>
+  </div>
+  <div class="card"><h2>Olasılıklar gerçekçi mi?</h2>
+    <p class="mut">Model favoriye %60 dediğinde favori gerçekten ~%60 kazanıyorsa olasılıklar güvenilir demektir.</p>
+    <table><tr><th>Model favoriye dedi</th><th class="r">Maç</th><th class="r">Ort. tahmin</th><th class="r">Gerçekleşen</th></tr>
+    ${r.cal.filter(c=>c.n>=5).map(c=>`<tr><td>%${Math.round(c.from*100)}–${Math.round(c.to*100)}</td><td class="r">${c.n}</td><td class="r">${p1(c.pred)}</td><td class="r"><b>${p1(c.hit)}</b></td></tr>`).join('')}</table>
+  </div>
+  <div class="card"><h2>Bahis türlerine göre</h2>
+    <p class="mut">"Ort. tahmin" ile "Tuttu" birbirine yakınsa model o pazarda dengeli. Son sütun: model %70+ dediği maçlarda kaç kez tuttu.</p>
+    <table><tr><th>Bahis</th><th class="r">Ort. tahmin</th><th class="r">Tuttu</th><th class="r">%70+ dediğinde</th></tr>
+    ${r.cats.map(c=>`<tr><td>${esc(c.name)}</td><td class="r">${p1(c.pred)}</td><td class="r">${p1(c.hit)}</td><td class="r">${c.hiN?`<b>${p1(c.hiHit)}</b> <span class="mut">(${c.hiN})</span>`:'–'}</td></tr>`).join('')}</table>
+  </div>
+  <div class="card"><h2>Son 12 tahmin</h2>
+    <table><tr><th>Maç</th><th class="r">Tahmin 1/X/2</th><th class="r">Skor</th></tr>
+    ${r.last.map(x=>{const pick = x.home>=x.draw&&x.home>=x.away?'h':x.away>=x.draw?'a':'d', act = x.hg>x.ag?'h':x.hg<x.ag?'a':'d';
+      return `<tr><td>${esc(x.hn)} – ${esc(x.an)}<div class="mut">tahmin ${x.top.h}-${x.top.a} · KG ${p1(x.btts)}</div></td><td class="r">${p1(x.home)}/${p1(x.draw)}/${p1(x.away)}</td><td class="r"><b class="${pick===act?'val':''}">${x.hg}-${x.ag}</b> ${pick===act?'✓':'✗'}</td></tr>`}).join('')}</table>
+  </div>
+  <div class="card mut">Not: Bu test sadece skorlara dayanan temel modeli ölçer. xG, sakatlık, ilk 11 ve oran bilgisi eklendiğinde gerçek kullanımda sonuçlar genelde biraz daha iyi olur. Futbolda en iyi modeller bile kazananı ~%50–55 bilir.</div>`;
 }
 
 state.key ? viewList() : viewSettings();

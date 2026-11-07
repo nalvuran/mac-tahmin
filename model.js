@@ -94,6 +94,90 @@
     return { lh, la, M, mk: markets(M), ratings: { aH, dH, aA, dA } };
   }
 
-  root.Model = { fitRatings, predict, matrix, markets, pois, xgFactor };
+  // Geriye dönük test: her maçı sadece o günden önceki sonuçlarla tahmin et.
+  // fixtures: [{home, away, hg, ag, ts, hn, an}] zamana göre sıralı. minGames: tahmine başlamadan önce gereken maç sayısı.
+  function backtest(fixtures, minGames) {
+    minGames = minGames || 40;
+    const fx = fixtures.slice().sort((a, b) => a.ts - b.ts);
+    const preds = [];
+    let i = 0, R = null, lastDay = null;
+    // ilk maçlardaki ev/beraberlik/deplasman oranları (taban çizgisi)
+    while (i < fx.length) {
+      const day = Math.floor(fx[i].ts / 86400);
+      if (i >= minGames) {
+        if (day !== lastDay) { R = fitRatings(fx.slice(0, i), fx[i].ts); lastDay = day; }
+        const f = fx[i];
+        if (R.att[f.home] && R.att[f.away]) {
+          const P = predict(R, f.home, f.away);
+          const past = fx.slice(0, i);
+          const base = {
+            home: past.filter(x => x.hg > x.ag).length / past.length,
+            draw: past.filter(x => x.hg === x.ag).length / past.length
+          };
+          base.away = 1 - base.home - base.draw;
+          preds.push({ f, mk: P.mk, lh: P.lh, la: P.la, base });
+        }
+      }
+      i++;
+    }
+    return summarize(preds);
+  }
+
+  function summarize(preds) {
+    const n = preds.length;
+    const res = p => p.f.hg > p.f.ag ? 'home' : p.f.hg < p.f.ag ? 'away' : 'draw';
+    let favHit = 0, brier = 0, brierBase = 0, ll = 0, llBase = 0, exact = 0, homeAlways = 0;
+    const cal = {}; // olasılık dilimleri: tahmin edilen favorinin gerçekleşme oranı
+    const bin = p => Math.min(9, Math.floor(p * 10));
+    const yesNo = { btts: [0, 0], o25: [0, 0], o15: [0, 0] }; // [doğru, toplam]
+    const conf = []; // "en yüksek ihtimal" kategorileri
+    const cats = {
+      '1.5 üst': (p, f) => [p.mk.over[1.5], f.hg + f.ag > 1.5],
+      '2.5 üst': (p, f) => [p.mk.over[2.5], f.hg + f.ag > 2.5],
+      '2.5 alt': (p, f) => [p.mk.under[2.5], f.hg + f.ag < 2.5],
+      '3.5 alt': (p, f) => [p.mk.under[3.5], f.hg + f.ag < 3.5],
+      'KG var': (p, f) => [p.mk.bttsYes, f.hg > 0 && f.ag > 0],
+      'KG yok': (p, f) => [p.mk.bttsNo, !(f.hg > 0 && f.ag > 0)],
+      'Ev sahibi kaybetmez (1X)': (p, f) => [p.mk.homeOrDraw, f.hg >= f.ag],
+      'Deplasman kaybetmez (X2)': (p, f) => [p.mk.awayOrDraw, f.ag >= f.hg],
+      'Favori kazanır': (p, f) => { const h = p.mk.home >= p.mk.away; return [h ? p.mk.home : p.mk.away, h ? f.hg > f.ag : f.ag > f.hg]; }
+    };
+    const thr = {}; Object.keys(cats).forEach(k => thr[k] = { all: [0, 0], hi: [0, 0], pSum: 0 });
+    preds.forEach(p => {
+      const r = res(p), mk = p.mk, f = p.f;
+      const probs = { home: mk.home, draw: mk.draw, away: mk.away };
+      const pick = Object.keys(probs).reduce((a, b) => probs[a] >= probs[b] ? a : b);
+      if (pick === r) favHit++;
+      if (r === 'home') homeAlways++;
+      ['home', 'draw', 'away'].forEach(k => {
+        brier += Math.pow(probs[k] - (k === r ? 1 : 0), 2);
+        brierBase += Math.pow(p.base[k] - (k === r ? 1 : 0), 2);
+      });
+      ll += -Math.log(Math.max(1e-6, probs[r])); llBase += -Math.log(Math.max(1e-6, p.base[r]));
+      const pf = probs[pick], b = bin(pf);
+      cal[b] = cal[b] || { n: 0, hit: 0, p: 0 }; cal[b].n++; cal[b].p += pf; if (pick === r) cal[b].hit++;
+      if (mk.topScores[0].h === f.hg && mk.topScores[0].a === f.ag) exact++;
+      const btts = f.hg > 0 && f.ag > 0;
+      yesNo.btts[1]++; if ((mk.bttsYes >= 0.5) === btts) yesNo.btts[0]++;
+      yesNo.o25[1]++; if ((mk.over[2.5] >= 0.5) === (f.hg + f.ag > 2.5)) yesNo.o25[0]++;
+      yesNo.o15[1]++; if ((mk.over[1.5] >= 0.5) === (f.hg + f.ag > 1.5)) yesNo.o15[0]++;
+      Object.keys(cats).forEach(k => {
+        const [pp, ok] = cats[k](p, f), t = thr[k];
+        t.all[1]++; if (ok) t.all[0]++; t.pSum += pp;
+        if (pp >= 0.7) { t.hi[1]++; if (ok) t.hi[0]++; }
+      });
+    });
+    return {
+      n, favHit: favHit / n, homeAlways: homeAlways / n,
+      brier: brier / n, brierBase: brierBase / n, ll: ll / n, llBase: llBase / n,
+      exact: exact / n,
+      btts: yesNo.btts[0] / n, o25: yesNo.o25[0] / n, o15: yesNo.o15[0] / n,
+      cal: Object.keys(cal).sort((a, b) => a - b).map(k => ({ from: k / 10, to: (+k + 1) / 10, n: cal[k].n, pred: cal[k].p / cal[k].n, hit: cal[k].hit / cal[k].n })),
+      cats: Object.keys(thr).map(k => ({ name: k, pred: thr[k].pSum / thr[k].all[1], hit: thr[k].all[0] / thr[k].all[1], hiN: thr[k].hi[1], hiHit: thr[k].hi[1] ? thr[k].hi[0] / thr[k].hi[1] : null })),
+      last: preds.slice(-12).reverse().map(p => ({ hn: p.f.hn, an: p.f.an, hg: p.f.hg, ag: p.f.ag, ts: p.f.ts, home: p.mk.home, draw: p.mk.draw, away: p.mk.away, top: p.mk.topScores[0], btts: p.mk.bttsYes, o25: p.mk.over[2.5] }))
+    };
+  }
+
+  root.Model = { fitRatings, predict, matrix, markets, pois, xgFactor, backtest };
   if (typeof module !== 'undefined') module.exports = root.Model;
 })(typeof window !== 'undefined' ? window : globalThis);
